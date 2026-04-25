@@ -25,7 +25,7 @@ class SmartCarController:
 
         # === 💾 数据库 ===
         print("正在连接数据库...")
-        self.db = DatabaseManager("patrol_record.db")
+        self.db = DatabaseManager()
 
         # === 🧠 AI模型 ===
         print("正在加载 YOLOv8 模型...")
@@ -58,6 +58,8 @@ class SmartCarController:
         self.is_avoiding = False
         self.last_patrol_cmd_time = 0
         self.save_cooldowns = {}
+        self.detection_buffer = {}  # 记录连续识别到的帧数，过滤偶尔一闪而过的误报
+        self.push_cooldowns = {}  # 单独控制微信推送的冷却时间（例如60秒推一次）
         # 🔥 新增：环境快照与宏观任务管理
         self.current_session_id = None  # None 表示没有在执行自动巡逻任务
         self.current_temp = 0  # 实时缓存的温度
@@ -117,6 +119,7 @@ class SmartCarController:
                 class_thresholds = {'can': 0.60, 'pothole': 0.20, 'manhole': 0.85}
                 colors = {'can': (255, 0, 255), 'manhole': (0, 0, 255), 'pothole': (0, 255, 0)}
 
+                current_detected_classes = set()
                 for box in results[0].boxes:
                     cls_id = int(box.cls[0])
                     conf = float(box.conf[0])
@@ -124,6 +127,7 @@ class SmartCarController:
                     target_conf = class_thresholds.get(cls_name, 0.6)
 
                     if conf > target_conf:
+                        current_detected_classes.add(cls_name)  # 记录本帧抓到了它
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         if (x2 - x1) > 600: continue
 
@@ -134,23 +138,49 @@ class SmartCarController:
 
                         if cls_name == 'pothole': self.warning_persistence = 10
 
-                        current_time = time.time()
-                        last_save = self.save_cooldowns.get(cls_name, 0)
-                        if conf > target_conf + 0.05 and (current_time - last_save > 10.0):
-                            try:
-                                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                                img_name = f"{timestamp}_{cls_name}.jpg"
-                                save_path = os.path.join(self.auto_dir, img_name)
-                                if not os.path.exists(save_path):
-                                    cv2.imwrite(save_path, frame)
-                                    # 🔥 传入当前的任务批次、类别、置信度、路径，以及当时的温湿度！
-                                    threading.Thread(target=self.db.insert_detection_event,
-                                                     args=(self.current_session_id, cls_name, conf, save_path,
-                                                           self.current_temp, self.current_humi), daemon=True).start()
-                                    self.save_cooldowns[cls_name] = current_time
-                                    print(f"📸 记录证据: {cls_name}")
-                            except Exception:
-                                pass
+                        # ==========================================
+                        # 🔥 核心改进：防抖与双重冷却机制
+                        # ==========================================
+                        # 1. 累加连续识别帧数
+                        self.detection_buffer[cls_name] = self.detection_buffer.get(cls_name, 0) + 1
+
+                        # 2. 只有连续 5 帧都稳定识别到，才认为是真正的目标（避免反光误报）
+                        if self.detection_buffer[cls_name] >= 5:
+                            current_time = time.time()
+                            last_save = self.save_cooldowns.get(cls_name, 0)
+                            last_push = self.push_cooldowns.get(cls_name, 0)
+
+                            # 【本地留证冷却】(10.0秒拍一次照存数据库)
+                            if conf > target_conf + 0.05 and (current_time - last_save > 10.0):
+                                try:
+                                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                                    img_name = f"{timestamp}_{cls_name}.jpg"
+                                    save_path = os.path.join(self.auto_dir, img_name)
+                                    if not os.path.exists(save_path):
+                                        cv2.imwrite(save_path, frame)
+                                        # 传入数据库
+                                        threading.Thread(target=self.db.insert_detection_event,
+                                                         args=(self.current_session_id, cls_name, conf, save_path,
+                                                               self.current_temp, self.current_humi),
+                                                         daemon=True).start()
+                                        self.save_cooldowns[cls_name] = current_time
+                                        print(f"📸 记录证据: {cls_name}")
+
+                                        # 【微信推送冷却】(单独限制：60秒才发一条微信消息，防轰炸)
+                                        if current_time - last_push > 60.0:
+                                            threading.Thread(target=self.send_wechat_alert,
+                                                             args=(
+                                                             cls_name, conf, self.current_temp, self.current_humi),
+                                                             daemon=True).start()
+                                            self.push_cooldowns[cls_name] = current_time
+
+                                except Exception as e:
+                                    print(f"保存或推送失败: {e}")
+
+                    # 🔥 帧后处理：如果某目标在本帧消失了，清空它的连续识别帧数
+                for cls in list(self.detection_buffer.keys()):
+                    if cls not in current_detected_classes:
+                        self.detection_buffer[cls] = 0
 
                 if self.warning_persistence > 0:
                     cv2.putText(annotated_frame, "POTHOLE DETECTED!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
@@ -429,6 +459,43 @@ class SmartCarController:
         else:
             print(f"[发送] {cmd_byte} ({action_name})")
 
+    # === 🔥 新增：微信告警推送 ===
+    def send_wechat_alert(self, cls_name, conf, temp, humi):
+        """调用 PushPlus API 发送微信通知"""
+        pushplus_token = "bb07e55e4f3e404ea8b581a36c58c040"
+
+        # 消息标题
+        title = f"🚨 巡检终端警报：发现 {cls_name}！"
+
+        # 消息正文（支持 HTML 格式，让在微信里看起来更好看）
+        content = f"""
+        <h3>🛡️ 智能城市巡检系统 实时告警</h3>
+        <p><b>⚠️ 异常类型：</b>{cls_name}</p>
+        <p><b>🎯 AI置信度：</b>{conf:.2f}</p>
+        <p><b>🌡️ 现场温度：</b>{temp} ℃</p>
+        <p><b>💧 现场湿度：</b>{humi} %</p>
+        <p><b>⏰ 发现时间：</b>{time.strftime("%Y-%m-%d %H:%M:%S")}</p>
+        <hr>
+        <p>请尽快登录上位机或派单处理！</p>
+        """
+
+        url = "http://www.pushplus.plus/send"
+        data = {
+            "token": pushplus_token,
+            "title": title,
+            "content": content,
+            "template": "html"
+        }
+
+        try:
+            # 发送请求
+            response = requests.post(url, json=data, timeout=5)
+            if response.status_code == 200:
+                print(f"📲 微信告警推送成功: {cls_name}")
+            else:
+                print("📲 微信告警推送失败")
+        except Exception as e:
+            print(f"📲 推送发生异常: {e}")
 
 if __name__ == "__main__":
     root = tk.Tk()
