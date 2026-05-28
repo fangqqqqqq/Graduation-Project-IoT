@@ -10,6 +10,8 @@
 #include "Buzzer.h"
 #include "DHT11.h"
 #include <stdio.h>  // 用于 sprintf
+#include "SoftSerial.h"  // 引入我们刚写的软件串口
+#include <string.h>
 
 uint8_t RxData, Num;
 uint8_t Servo_Flag;
@@ -24,6 +26,29 @@ uint16_t Report_Timer = 0;
 uint16_t Display_Timer = 0; 
 uint8_t Display_Mode = 0;   // 0:行驶模式, 1:环境模式
 char Tx_Buffer[64];         
+char GPS_Lat_Str[20] = "0.00"; // 存放纬度字符串
+char GPS_Lon_Str[20] = "0.00"; // 存放经度字符串
+
+// 专门用来在后台提取经纬度的函数
+void Parse_GPS_Background(void)
+{
+    char *ptr = strstr(GPS_Buffer, "$GNRMC");
+    // 确保找到了开头，并且这句话接收完整了
+    if (ptr != NULL && strchr(ptr, '\n') != NULL)
+    {
+        // 检查标志位 'A'，确认卫星已锁定
+        if (strstr(ptr, ",A,") != NULL)
+        {
+            char time[20], status, ns, ew, speed[10], course[10], date[20];
+            // 提取经纬度字符串（用字符串极其安全，不会导致死机）
+            sscanf(ptr, "$GNRMC,%[^,],%c,%[^,],%c,%[^,],%c,%[^,],%[^,],%[^,]",
+                   time, &status, GPS_Lat_Str, &ns, GPS_Lon_Str, &ew, speed, course, date);
+        }
+        // 清空缓冲区，等待下一句
+        memset(GPS_Buffer, 0, sizeof(GPS_Buffer));
+        GPS_Index = 0;
+    }
+}
 
 int main(void)
 {
@@ -35,6 +60,7 @@ int main(void)
     LineWalking_Init();
     Buzzer_Init();
     DHT11_Init();
+		SoftSerial_Init();
     
     Servo_SetAngle(90); 
     
@@ -69,10 +95,13 @@ int main(void)
         // ==========================================
         // 2. 数据上报 (发送给 Python)
         // ==========================================
+				Parse_GPS_Background();
         Report_Timer++;
         if(Report_Timer > 20) 
         {
-            sprintf(Tx_Buffer, "#D:%.1f,T:%d,H:%d*\r\n", Current_Dist, Temp_Val, Humi_Val);
+						// 把 La (纬度) 和 Lo (经度) 加进我们要发送的密文里
+            sprintf(Tx_Buffer, "#D:%.1f,T:%d,H:%d,La:%s,Lo:%s*\r\n", 
+                    Current_Dist, Temp_Val, Humi_Val, GPS_Lat_Str, GPS_Lon_Str);
             Serial_SendString(Tx_Buffer); 
             Report_Timer = 0;
         }

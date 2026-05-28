@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python -c ' *)",
+      "Bash(NO_PROXY=* no_proxy=* python -c ' *)"
+    ]
+  }
+}

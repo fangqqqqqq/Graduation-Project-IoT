@@ -4,7 +4,7 @@ if __name__ == '__main__':
     # 1. 加载模型
     # 必须用 n (nano) 版本，因为它是参数最少、计算量最小的
     print("正在加载 YOLOv8n 模型 (CPU模式)...")
-    model = YOLO('yolov8n.pt')
+    model = YOLO('yolov8n-cbam.yaml')
 
     # 2. 开始训练
     print("🚀 开始 CPU 训练 (这需要很长时间，请耐心等待)...")
@@ -36,5 +36,5 @@ if __name__ == '__main__':
         patience=10,
 
         # 结果保存的名字
-        name='city_patrol_cpu_run'
+        name='city_patrol_cbam_run'
     )

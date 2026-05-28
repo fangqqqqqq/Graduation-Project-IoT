@@ -29,15 +29,47 @@ class DatabaseManager:
             conn = sqlite3.connect(self.local_db_name, check_same_thread=False)
             conn.execute("PRAGMA foreign_keys = ON")
             cursor = conn.cursor()
-            cursor.execute(
-                '''CREATE TABLE IF NOT EXISTS patrol_sessions (session_id INTEGER PRIMARY KEY AUTOINCREMENT, start_time TEXT, end_time TEXT, status TEXT DEFAULT '巡逻中')''')
-            cursor.execute(
-                '''CREATE TABLE IF NOT EXISTS sensor_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER, timestamp TEXT, distance REAL, temperature INTEGER, humidity INTEGER, note TEXT, FOREIGN KEY(session_id) REFERENCES patrol_sessions(session_id))''')
-            cursor.execute(
-                '''CREATE TABLE IF NOT EXISTS detection_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER, timestamp TEXT, object_type TEXT, confidence REAL, image_path TEXT, snapshot_temp INTEGER, snapshot_humi INTEGER, status TEXT DEFAULT '🔴 待处理', FOREIGN KEY(session_id) REFERENCES patrol_sessions(session_id))''')
+            # 巡逻会话表
+            cursor.execute('''CREATE TABLE IF NOT EXISTS patrol_sessions (
+                                session_id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                                start_time TEXT, 
+                                end_time TEXT, 
+                                status TEXT DEFAULT '巡逻中')''')
+
+            # 传感器日志表 - 已新增经纬度字段
+            cursor.execute('''CREATE TABLE IF NOT EXISTS sensor_logs (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                session_id INTEGER,
+                                timestamp TEXT,
+                                distance REAL,
+                                temperature INTEGER,
+                                humidity INTEGER,
+                                latitude TEXT,
+                                longitude TEXT,
+                                location_name TEXT,
+                                note TEXT,
+                                FOREIGN KEY(session_id) REFERENCES patrol_sessions(session_id))''')
+
+            # AI 检测日志表
+            cursor.execute('''CREATE TABLE IF NOT EXISTS detection_logs (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                                session_id INTEGER, 
+                                timestamp TEXT, 
+                                object_type TEXT, 
+                                confidence REAL, 
+                                image_path TEXT, 
+                                snapshot_temp INTEGER, 
+                                snapshot_humi INTEGER, 
+                                status TEXT DEFAULT '🔴 待处理', 
+                                FOREIGN KEY(session_id) REFERENCES patrol_sessions(session_id))''')
+            # 兼容旧表：补增 location_name 列
+            try:
+                cursor.execute("ALTER TABLE sensor_logs ADD COLUMN location_name TEXT")
+            except:
+                pass  # 列已存在则忽略
             conn.commit()
             conn.close()
-            print("💾 本地边缘数据库就绪！")
+            print("💾 本地边缘数据库就绪（已更新经纬度支持）！")
         except Exception as e:
             print(f"本地DB初始化失败: {e}")
 
@@ -52,25 +84,49 @@ class DatabaseManager:
         try:
             conn = self.get_cloud_conn()
             cursor = conn.cursor()
-            cursor.execute(
-                '''CREATE TABLE IF NOT EXISTS patrol_sessions (session_id INT PRIMARY KEY, start_time DATETIME, end_time DATETIME, status VARCHAR(50) DEFAULT '巡逻中')''')
-            cursor.execute(
-                '''CREATE TABLE IF NOT EXISTS sensor_logs (id INT PRIMARY KEY AUTO_INCREMENT, session_id INT, timestamp DATETIME, distance FLOAT, temperature INT, humidity INT, note VARCHAR(255), FOREIGN KEY(session_id) REFERENCES patrol_sessions(session_id) ON DELETE CASCADE)''')
-            cursor.execute(
-                '''CREATE TABLE IF NOT EXISTS detection_logs (id INT PRIMARY KEY AUTO_INCREMENT, session_id INT, timestamp DATETIME, object_type VARCHAR(50), confidence FLOAT, image_path VARCHAR(255), snapshot_temp INT, snapshot_humi INT, status VARCHAR(50) DEFAULT '🔴 待处理', FOREIGN KEY(session_id) REFERENCES patrol_sessions(session_id) ON DELETE CASCADE)''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS patrol_sessions (
+                                session_id INT PRIMARY KEY, 
+                                start_time DATETIME, 
+                                end_time DATETIME, 
+                                status VARCHAR(50) DEFAULT '巡逻中')''')
+
+            # 云端表结构同步更新
+            cursor.execute('''CREATE TABLE IF NOT EXISTS sensor_logs (
+                                id INT PRIMARY KEY AUTO_INCREMENT,
+                                session_id INT,
+                                timestamp DATETIME,
+                                distance FLOAT,
+                                temperature INT,
+                                humidity INT,
+                                latitude VARCHAR(50),
+                                longitude VARCHAR(50),
+                                location_name VARCHAR(255),
+                                note VARCHAR(255),
+                                FOREIGN KEY(session_id) REFERENCES patrol_sessions(session_id) ON DELETE CASCADE)''')
+
+            cursor.execute('''CREATE TABLE IF NOT EXISTS detection_logs (
+                                id INT PRIMARY KEY AUTO_INCREMENT, 
+                                session_id INT, 
+                                timestamp DATETIME, 
+                                object_type VARCHAR(50), 
+                                confidence FLOAT, 
+                                image_path VARCHAR(255), 
+                                snapshot_temp INT, 
+                                snapshot_humi INT, 
+                                status VARCHAR(50) DEFAULT '🔴 待处理', 
+                                FOREIGN KEY(session_id) REFERENCES patrol_sessions(session_id) ON DELETE CASCADE)''')
             conn.close()
             print("☁️ 阿里云数据库同步通道就绪！")
         except Exception as e:
             print(f"⚠️ 云端通道未连接 (系统将处于离线边缘模式): {e}")
 
     # ==========================================
-    # 🚀 业务生命周期 (以本地ID为准，强制云端同步)
+    # 🚀 业务生命周期
     # ==========================================
     def start_session(self):
         local_id = None
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 1. 强制写入本地 (生成唯一 ID)
         try:
             conn = sqlite3.connect(self.local_db_name, check_same_thread=False, timeout=5)
             cursor = conn.cursor()
@@ -81,7 +137,6 @@ class DatabaseManager:
         except Exception as e:
             print(f"启动任务(本地)失败: {e}")
 
-        # 2. 尝试同步到云端 (强制使用本地生成的 ID，确保双端外键一致)
         if local_id is not None:
             try:
                 conn = self.get_cloud_conn()
@@ -97,7 +152,6 @@ class DatabaseManager:
         if not session_id: return
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 本地更新
         try:
             conn = sqlite3.connect(self.local_db_name, timeout=5)
             conn.execute("UPDATE patrol_sessions SET end_time = ?, status = '已结束' WHERE session_id = ?",
@@ -107,7 +161,6 @@ class DatabaseManager:
         except Exception:
             pass
 
-        # 云端同步
         try:
             conn = self.get_cloud_conn()
             conn.cursor().execute("UPDATE patrol_sessions SET end_time = %s, status = '已结束' WHERE session_id = %s",
@@ -117,34 +170,33 @@ class DatabaseManager:
             pass
 
     # ==========================================
-    # 📡 数据双写引擎 (Dual-Write Engine)
+    # 📡 数据双写引擎 - 已更新以支持 GPS 数据
     # ==========================================
-    def insert_sensor_data(self, session_id, dist, temp, humi, note="定时记录"):
+    def insert_sensor_data(self, session_id, dist, temp, humi, lat, lon, location_name="", note="定时记录"):
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # 1. 本地备份
         try:
             conn = sqlite3.connect(self.local_db_name, timeout=5)
             conn.execute(
-                "INSERT INTO sensor_logs (session_id, timestamp, distance, temperature, humidity, note) VALUES (?, ?, ?, ?, ?, ?)",
-                (session_id, now, dist, temp, humi, note))
+                "INSERT INTO sensor_logs (session_id, timestamp, distance, temperature, humidity, latitude, longitude, location_name, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, now, dist, temp, humi, lat, lon, location_name, note))
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"本地数据插入失败: {e}")
 
         # 2. 云端同步
         try:
             conn = self.get_cloud_conn()
             conn.cursor().execute(
-                "INSERT INTO sensor_logs (session_id, timestamp, distance, temperature, humidity, note) VALUES (%s, %s, %s, %s, %s, %s)",
-                (session_id, now, dist, temp, humi, note))
+                "INSERT INTO sensor_logs (session_id, timestamp, distance, temperature, humidity, latitude, longitude, location_name, note) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (session_id, now, dist, temp, humi, lat, lon, location_name, note))
             conn.close()
         except Exception:
             pass
 
     def insert_detection_event(self, session_id, obj_type, conf, img_path, temp, humi):
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # 1. 本地留证
         try:
             conn = sqlite3.connect(self.local_db_name, timeout=10)
             conn.execute(
@@ -152,40 +204,28 @@ class DatabaseManager:
                 (session_id, now, obj_type, conf, img_path, temp, humi))
             conn.commit()
             conn.close()
-            print(f"✅ [边缘端] 证据已保存: {obj_type}")
-        except Exception as e:
-            print(f"❌ [边缘端] 写入失败: {e}")
+        except Exception:
+            pass
 
-        # 2. 实时上云
         try:
             conn = self.get_cloud_conn()
             conn.cursor().execute(
                 "INSERT INTO detection_logs (session_id, timestamp, object_type, confidence, image_path, snapshot_temp, snapshot_humi) VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (session_id, now, obj_type, conf, img_path, temp, humi))
             conn.close()
-            print(f"☁️ [云端] 证据已同步: {obj_type}")
-        except Exception as e:
-            print(f"⚠️ [云端] 同步延迟 (断网不影响本地): {e}")
-
-    # ==========================================
-    # 🔄 UI 状态更新与读取 (优先读取本地，保证极速响应)
-    # ==========================================
-    def update_detection_status(self, record_id, new_status):
-        try:
-            conn = sqlite3.connect(self.local_db_name, timeout=5)
-            conn.execute("UPDATE detection_logs SET status = ? WHERE id = ?", (new_status, record_id))
-            conn.commit()
-            conn.close()
         except Exception:
             pass
-        # 注：为了简化毕设逻辑，UI状态更新暂不同步云端，以免双端冲突，以本地指挥台为准。
 
+    # ==========================================
+    # 🔄 数据读取
+    # ==========================================
     def fetch_sensor_logs(self, limit=50):
         try:
             conn = sqlite3.connect(self.local_db_name, timeout=5)
             cursor = conn.cursor()
+            # 更新查询语句，包含经纬度
             cursor.execute(
-                'SELECT id, session_id, timestamp, distance, temperature, humidity, note FROM sensor_logs ORDER BY id DESC LIMIT ?',
+                'SELECT id, session_id, timestamp, distance, temperature, humidity, latitude, longitude, location_name, note FROM sensor_logs ORDER BY id DESC LIMIT ?',
                 (limit,))
             rows = cursor.fetchall()
             conn.close()
@@ -205,3 +245,69 @@ class DatabaseManager:
             return rows
         except:
             return []
+
+    def update_detection_status(self, record_id, new_status):
+        try:
+            conn = sqlite3.connect(self.local_db_name, timeout=5)
+            conn.execute("UPDATE detection_logs SET status = ? WHERE id = ?", (new_status, record_id))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    # ==========================================
+    # 📡 断网容灾自动重传机制 (补全论文逻辑)
+    # ==========================================
+    def sync_offline_data(self):
+        """同步断网期间遗留在本地的数据到云端"""
+        print("🔄 正在检测并同步离线遗留数据到阿里云...")
+        try:
+            local_conn = sqlite3.connect(self.local_db_name, timeout=5)
+            local_cursor = local_conn.cursor()
+
+            cloud_conn = self.get_cloud_conn()
+            cloud_cursor = cloud_conn.cursor()
+
+            # 1. 补传丢失的巡逻会话 (patrol_sessions)
+            local_cursor.execute("SELECT session_id, start_time, end_time, status FROM patrol_sessions")
+            for row in local_cursor.fetchall():
+                try:
+                    # 使用 INSERT IGNORE，如果云端已经有了就不插入，没有的（断网期间的）就会被插入
+                    cloud_cursor.execute(
+                        "INSERT IGNORE INTO patrol_sessions (session_id, start_time, end_time, status) VALUES (%s, %s, %s, %s)",
+                        row
+                    )
+                except Exception:
+                    pass
+
+            # 2. 补传丢失的检测记录 (detection_logs)
+            local_cursor.execute(
+                "SELECT id, session_id, timestamp, object_type, confidence, image_path, snapshot_temp, snapshot_humi, status FROM detection_logs")
+            for row in local_cursor.fetchall():
+                try:
+                    cloud_cursor.execute(
+                        "INSERT IGNORE INTO detection_logs (id, session_id, timestamp, object_type, confidence, image_path, snapshot_temp, snapshot_humi, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        row
+                    )
+                except Exception:
+                    pass
+
+            # 3. 补传丢失的传感器记录 (sensor_logs)
+            local_cursor.execute(
+                "SELECT id, session_id, timestamp, distance, temperature, humidity, latitude, longitude, location_name, note FROM sensor_logs")
+            for row in local_cursor.fetchall():
+                try:
+                    cloud_cursor.execute(
+                        "INSERT IGNORE INTO sensor_logs (id, session_id, timestamp, distance, temperature, humidity, latitude, longitude, location_name, note) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        row
+                    )
+                except Exception:
+                    pass
+
+            cloud_conn.commit()
+            cloud_conn.close()
+            local_conn.close()
+            print("✅ 离线数据同步完成！缺失数据已补齐至阿里云。")
+
+        except Exception as e:
+            print(f"⚠️ 同步失败 (可能网络仍未恢复): {e}")

@@ -27,8 +27,14 @@ class SmartCarController:
         print("正在连接数据库...")
         self.db = DatabaseManager()
 
-        # === 🧠 AI模型 ===
-        print("正在加载 YOLOv8 模型...")
+        # ==========================================
+        # 🔥 新增：方法一 (启动时自动执行断网容灾重传)
+        # ==========================================
+        print("启动后台容灾同步守护线程...")
+        threading.Thread(target=self.db.sync_offline_data, daemon=True).start()
+
+        # === 🧠 AI模型 (主线实时模型) ===
+        print("正在加载 YOLOv8 主线模型...")
         try:
             self.model = YOLO(
                 r'D:\Pycharm\workplace\Graduation_project\runs\detect\city_patrol_cpu_run\weights\best.pt')
@@ -38,6 +44,8 @@ class SmartCarController:
             self.model = None
 
         self.ai_enabled = True
+        # 🔥 将各个类的默认置信度存在字典中，供两个界面联动使用
+        self.class_thresholds = {'can': 0.65, 'pothole': 0.50, 'manhole': 0.65}
         self.rotation_state = 0
         self.photo_counter = 0
 
@@ -60,10 +68,17 @@ class SmartCarController:
         self.save_cooldowns = {}
         self.detection_buffer = {}  # 记录连续识别到的帧数，过滤偶尔一闪而过的误报
         self.push_cooldowns = {}  # 单独控制微信推送的冷却时间（例如60秒推一次）
+
         # 🔥 新增：环境快照与宏观任务管理
         self.current_session_id = None  # None 表示没有在执行自动巡逻任务
         self.current_temp = 0  # 实时缓存的温度
         self.current_humi = 0  # 实时缓存的湿度
+
+        # 🔥 新增：GPS 逆地理编码缓存
+        self.amap_key = "1e320c1d74a40dac82a55d080eeba6e9"
+        self.last_location_name = ""
+        self.last_resolved_lat = 0.0
+        self.last_resolved_lon = 0.0
 
         # === 🎨 界面配色 ===
         self.style_cfg = {
@@ -78,8 +93,8 @@ class SmartCarController:
         self.window.configure(bg=self.style_cfg["bg_main"])
 
         # === ⚙️ 硬件连接 ===
-        self.video_source = "http://10.181.200.123:81/stream"
-        self.esp_ip = "10.181.200.123"
+        self.video_source = "http://10.172.191.123:81/stream"
+        self.esp_ip = "10.172.191.123"
         self.default_com = "COM12"
         self.ser = None
         self.is_connected = False
@@ -116,7 +131,6 @@ class SmartCarController:
                 results = self.model(frame, verbose=False, conf=0.15)
                 annotated_frame = frame.copy()
 
-                class_thresholds = {'can': 0.60, 'pothole': 0.20, 'manhole': 0.85}
                 colors = {'can': (255, 0, 255), 'manhole': (0, 0, 255), 'pothole': (0, 255, 0)}
 
                 current_detected_classes = set()
@@ -124,7 +138,8 @@ class SmartCarController:
                     cls_id = int(box.cls[0])
                     conf = float(box.conf[0])
                     cls_name = results[0].names[cls_id]
-                    target_conf = class_thresholds.get(cls_name, 0.6)
+                    # 使用全局动态阈值，不再是硬编码
+                    target_conf = self.class_thresholds.get(cls_name, 0.6)
 
                     if conf > target_conf:
                         current_detected_classes.add(cls_name)  # 记录本帧抓到了它
@@ -170,14 +185,14 @@ class SmartCarController:
                                         if current_time - last_push > 60.0:
                                             threading.Thread(target=self.send_wechat_alert,
                                                              args=(
-                                                             cls_name, conf, self.current_temp, self.current_humi),
+                                                                 cls_name, conf, self.current_temp, self.current_humi),
                                                              daemon=True).start()
                                             self.push_cooldowns[cls_name] = current_time
 
                                 except Exception as e:
                                     print(f"保存或推送失败: {e}")
 
-                    # 🔥 帧后处理：如果某目标在本帧消失了，清空它的连续识别帧数
+                # 🔥 帧后处理：如果某目标在本帧消失了，清空它的连续识别帧数
                 for cls in list(self.detection_buffer.keys()):
                     if cls not in current_detected_classes:
                         self.detection_buffer[cls] = 0
@@ -219,13 +234,24 @@ class SmartCarController:
             try:
                 line = self.ser.readline().decode('utf-8', errors='ignore').strip()
                 if line:
-                    match = re.search(r"#D:([\d\.]+),T:(\d+),H:(\d+)\*", line)
+                    # 匹配带经纬度的新格式报文
+                    match = re.search(r"#D:([\d\.]+),T:(\d+),H:(\d+),La:([\d\.]+),Lo:([\d\.]+)\*", line)
                     if match:
-                        dist, temp, humi = match.groups()
-                        # 🔥 实时缓存，供摄像头快照使用
+                        dist, temp, humi, raw_lat, raw_lon = match.groups()
+
+                        # 🔥 调用转换函数，把原始数据洗成标准十进制
+                        lat = self.convert_nmea_to_decimal(raw_lat)
+                        lon = self.convert_nmea_to_decimal(raw_lon)
+
+                        # 实时缓存，供摄像头快照使用
                         self.current_temp = int(temp)
                         self.current_humi = int(humi)
-                        self.window.after(0, lambda: self.update_sensor_ui(dist, temp, humi))
+
+                        # 逆地理编码（带缓存）
+                        location_name = self.resolve_location_name(lat, lon)
+
+                        # 刷新UI界面
+                        self.window.after(0, lambda ln=location_name: self.update_sensor_ui(dist, temp, humi, lat, lon, ln))
 
                         curr = time.time()
                         save = False
@@ -238,86 +264,77 @@ class SmartCarController:
                             save, note = True, "定时记录"
 
                         if save:
-                            # 🔥 传入 session_id
+                            # 存入数据库 (含 lat, lon 及逆地理编码地名)
                             threading.Thread(target=self.db.insert_sensor_data,
-                                             args=(self.current_session_id, float(dist), int(temp), int(humi), note),
+                                             args=(self.current_session_id, float(dist), int(temp), int(humi), lat, lon,
+                                                   location_name, note),
                                              daemon=True).start()
                             last_saved_temp, last_saved_humi, last_save_time = int(temp), int(humi), curr
             except Exception:
                 pass
             time.sleep(0.05)
 
-    # === 🔥 通用模式识别功能 (新增) ===
-    def select_image(self):
-        """弹出文件选择器，选择本地图片"""
-        file_path = filedialog.askopenfilename(
-            title="选择需要分析的照片",
-            filetypes=[("Image Files", "*.jpg *.jpeg *.png *.bmp")]
-        )
-        if file_path:
-            self.selected_image_path = file_path
-            display_name = os.path.basename(file_path)
-            # 缩短显示路径以免撑破UI
-            if len(display_name) > 20: display_name = display_name[:17] + "..."
-            self.lbl_pattern_path.config(text=f"📂 已选: {display_name}", fg="white")
-            self.lbl_pattern_result.config(text="分析结果: 就绪，请点击分析")
+    # === 🔥 独立工作台: 图像离线分析核心 ===
+    def open_image_analysis_window(self):
+        """打开独立的图像分析工作台"""
+        from ui_module import ImageAnalysisWindow
+        ImageAnalysisWindow(self.window, self)
 
-    def analyze_image(self):
-        """对选中的图片调用 YOLOv8 进行离线识别"""
-        if not self.selected_image_path:
-            messagebox.showwarning("提示", "请先点击【上传照片】选择文件！")
-            return
-        if not self.model:
-            messagebox.showerror("错误", "YOLO 模型未成功加载！")
-            return
-
-        self.lbl_pattern_result.config(text="分析结果: 正在进行 AI 推理...")
-        self.window.update()  # 强制更新 UI 状态
+    def perform_offline_analysis(self, image_path, selected_model, custom_thresholds):
+        """供独立工作台调用的核心分析引擎 (支持动态模型切换)"""
+        # 防止选择空模型
+        if selected_model == "未找到模型文件" or not selected_model.endswith(".pt"):
+            return cv2.imread(image_path), "⚠️ 未选择有效的 .pt 模型"
 
         try:
-            # 1. 读取图像
-            img = cv2.imread(self.selected_image_path)
-            if img is None: raise ValueError("无法读取该图像文件，可能已损坏。")
+            # === 1. 智能热加载模型机制 ===
+            # 如果是第一次离线分析，或者用户在下拉菜单里换了新模型，才重新加载
+            if not hasattr(self, 'offline_model_name') or self.offline_model_name != selected_model or not hasattr(self,
+                                                                                                                   'offline_model'):
+                print(f"正在加载离线模型: {selected_model} ...")
+                from ultralytics import YOLO
+                self.offline_model = YOLO(selected_model)  # 加载新模型
+                self.offline_model_name = selected_model  # 记录当前加载的模型名
+                print("模型加载完成！")
 
-            # 2. 推理
-            results = self.model(img, verbose=False)
+            img = cv2.imread(image_path)
+            if img is None: return None, "图像读取失败"
+
+            # === 2. 使用动态加载的离线模型进行推理 ===
+            results = self.offline_model(img, verbose=False)
             detected_items = []
             annotated_img = img.copy()
 
-            # 3. 绘制检测框与汇总结果
+            # === 3. 画框，应用右侧面板传过来的动态阈值 ===
             for box in results[0].boxes:
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
                 cls_name = results[0].names[cls_id]
-                detected_items.append(f"{cls_name}({conf:.2f})")
 
-                # 画框
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(annotated_img, f"{cls_name} {conf:.2f}", (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                # 读取传进来的阈值，如果没设则默认 0.5
+                target_conf = custom_thresholds.get(cls_name, 0.5)
 
-            # 4. 更新UI与保存结果
+                # 只有高于新阈值才画框
+                if conf > target_conf:
+                    detected_items.append(f"{cls_name}({conf:.2f})")
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(annotated_img, f"{cls_name} {conf:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                                (0, 255, 0), 2)
+
+            # === 4. 返回处理结果给 UI ===
             if detected_items:
                 res_str = " | ".join(detected_items)
-                self.lbl_pattern_result.config(text=f"发现目标: {res_str}")
-
-                # 保存分析图
+                # 可选：保存带框的分析结果到 data_patterns 文件夹
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
-                save_path = os.path.join(self.pattern_dir, f"analyzed_{timestamp}.jpg")
-                cv2.imwrite(save_path, annotated_img)
-
-                # 弹窗展示识别结果
-                cv2.imshow("Analysis Result (Press any key to close)", cv2.resize(annotated_img, (640, 480)))
-                cv2.waitKey(0)  # 暂停等待用户按键关闭弹窗
-                cv2.destroyAllWindows()
+                cv2.imwrite(os.path.join(self.pattern_dir, f"analyzed_{timestamp}.jpg"), annotated_img)
+                return annotated_img, f"发现 {res_str}"
             else:
-                self.lbl_pattern_result.config(text="分析结果: 未检测到任何预设目标")
-                messagebox.showinfo("分析完毕", "该照片中未检测到目标物。")
+                return annotated_img, "未检测到预设目标"
 
         except Exception as e:
-            self.lbl_pattern_result.config(text="分析结果: 发生异常")
-            messagebox.showerror("识别错误", f"分析过程中出现错误: {str(e)}")
+            print(f"离线分析异常: {e}")
+            return cv2.imread(image_path), f"分析异常: {e}"
 
     # === 其它功能函数 ===
     def refresh_video_stream(self):
@@ -403,10 +420,101 @@ class SmartCarController:
             self.btn_connect.config(text="连接", bg=self.style_cfg["btn_normal"])
             self.status_label.config(text="状态: ❌ 已断开", fg="gray")
 
-    def update_sensor_ui(self, d, t, h):
+    def update_sensor_ui(self, d, t, h, lat, lon, location_name=""):
+        # 1. 更新文字标签
         self.lbl_dist.config(text=f"📏 {d} cm")
         self.lbl_temp.config(text=f"🌡️ {t} ℃")
         self.lbl_humi.config(text=f"💧 {h} %")
+        self.lbl_lat.config(text=f"北纬(N): {lat}")
+        self.lbl_lon.config(text=f"东经(E): {lon}")
+        if hasattr(self, 'lbl_location') and self.lbl_location:
+            if location_name:
+                self.lbl_location.config(text=f"📍 {location_name}")
+            else:
+                self.lbl_location.config(text="📍 实际位置: --")
+
+        # === 🔥 2. 更新动态折线图 ===
+        try:
+            # 将新数据追加到队列右侧，自动挤掉最老的数据
+            self.temp_data.append(int(t))
+            self.humi_data.append(int(h))
+
+            # 更新线条的数据
+            self.line_temp.set_ydata(self.temp_data)
+            self.line_humi.set_ydata(self.humi_data)
+
+            # 让 Matplotlib 重新绘制图表
+            self.graph_canvas.draw_idle()
+        except Exception as e:
+            print(f"图表更新失败: {e}")
+
+    def convert_nmea_to_decimal(self, nmea_str):
+        """将 GPS 的 NMEA 格式 (ddmm.mmmmm) 转换为标准十进制度数"""
+        try:
+            if not nmea_str or float(nmea_str) == 0:
+                return "0.000000"
+
+            nmea_val = float(nmea_str)
+            # 提取“度” (除以100取整，例如 3446.93 // 100 = 34)
+            degrees = int(nmea_val / 100)
+            # 提取“分” (原数字减去度数*100，例如 3446.93 - 3400 = 46.93)
+            minutes = nmea_val - (degrees * 100)
+
+            # 换算公式：度 + (分 / 60)
+            decimal_degrees = degrees + (minutes / 60.0)
+
+            # 返回保留 6 位小数的标准字符串
+            return f"{decimal_degrees:.6f}"
+        except Exception:
+            return "0.000000"
+
+    # === 🔥 逆地理编码：经纬度 → 实际地名 (高德 API) ===
+    def reverse_geocode(self, lat, lon):
+        """调用高德逆地理编码 API，返回格式化地址字符串"""
+        try:
+            url = f"https://restapi.amap.com/v3/geocode/regeo?key={self.amap_key}&location={lon},{lat}&extensions=base"
+            resp = requests.get(url, timeout=3, proxies={"http": None, "https": None})
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "1" and data.get("regeocode"):
+                    return data["regeocode"].get("formatted_address", "")
+                else:
+                    print(f"高德API返回异常: {data.get('info', 'unknown')}")
+        except Exception as e:
+            print(f"逆地理编码请求失败: {e}")
+        return ""
+
+    def resolve_location_name(self, lat_str, lon_str):
+        """带缓存判断的逆地理编码入口：0.000000 跳过，相近坐标复用缓存"""
+        try:
+            lat_f = float(lat_str)
+            lon_f = float(lon_str)
+        except:
+            return ""
+
+        if lat_f == 0.0 and lon_f == 0.0:
+            return ""
+
+        # 坐标变化 < 0.0003°（约30m），直接复用上次结果
+        if (abs(lat_f - self.last_resolved_lat) < 0.0003 and
+                abs(lon_f - self.last_resolved_lon) < 0.0003 and
+                self.last_location_name):
+            return self.last_location_name
+
+        # 后台线程请求 API，避免阻塞串口读取
+        threading.Thread(target=self._do_geocode, args=(lat_f, lon_f), daemon=True).start()
+        return self.last_location_name  # 首次先返回旧值，下次刷新时更新
+
+    def _do_geocode(self, lat_f, lon_f):
+        """实际执行 API 请求并更新缓存 + 刷新 UI"""
+        addr = self.reverse_geocode(lat_f, lon_f)
+        if addr:
+            self.last_resolved_lat = lat_f
+            self.last_resolved_lon = lon_f
+            self.last_location_name = addr
+            # 主动刷新 UI 上的位置标签
+            if hasattr(self, 'lbl_location') and self.lbl_location:
+                self.window.after(0, lambda: self.lbl_location.config(text=f"📍 {addr}"))
 
     # === 🔥 键盘绑定 ===
     def bind_keys(self):
@@ -496,6 +604,7 @@ class SmartCarController:
                 print("📲 微信告警推送失败")
         except Exception as e:
             print(f"📲 推送发生异常: {e}")
+
 
 if __name__ == "__main__":
     root = tk.Tk()

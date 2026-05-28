@@ -794,6 +794,16 @@
               <FileType>5</FileType>
               <FilePath>.\Hardware\DHT11.h</FilePath>
             </File>
+            <File>
+              <FileName>SoftSerial.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\SoftSerial.c</FilePath>
+            </File>
+            <File>
+              <FileName>SoftSerial.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\SoftSerial.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -830,5 +840,14 @@
     <components/>
     <files/>
   </RTE>
+
+  <LayerInfo>
+    <Layers>
+      <Layer>
+        <LayName>Project</LayName>
+        <LayPrjMark>1</LayPrjMark>
+      </Layer>
+    </Layers>
+  </LayerInfo>
 
 </Project>
